@@ -1,0 +1,12 @@
+[Unit]
+Description=Keep windows on their workspaces when Umbriel loses a monitor
+PartOf=umbriel-session.target
+After=umbriel-session.target
+
+[Service]
+ExecStart=%h/.local/bin/umbriel-workspace-keeper
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=umbriel-session.target

@@ -1,0 +1,307 @@
+#!/usr/bin/env python3
+"""Keep windows on the same workspace when Umbriel loses and regains a monitor.
+
+When an output disappears, Umbriel piles all of its windows onto the active
+workspace of a remaining output. This daemon moves each of them to the
+workspace with the same name (or position) there instead, and moves them back
+to their original output when it returns.
+
+Moving a window explicitly clears Umbriel's own memory of its old home, so
+the move back is done here as well.
+
+With --adopt-new-outputs, windows waiting for a monitor that hasn't come back
+move to a different monitor that appears instead, such as a dock at work
+whose connector name differs from the one at home.
+"""
+
+import argparse
+import json
+import logging
+import os
+import selectors
+import subprocess
+import sys
+import time
+from dataclasses import asdict, dataclass, replace
+
+log = logging.getLogger("umbriel-workspace-keeper")
+
+# Quiet time after the last event before reconciling. Hotplug produces a burst
+# of events, and so do our own moves.
+DEBOUNCE_S = 0.4
+# Never let a steady stream of events postpone a reconcile longer than this.
+MAX_DELAY_S = 2.0
+# Connector prefixes of built-in panels, which never adopt or get adopted.
+INTERNAL_PREFIXES = ("eDP", "LVDS", "DSI")
+
+
+@dataclass(frozen=True)
+class Home:
+    output: str
+    name: str
+    named: bool
+    index: int
+    x: int = 0
+    y: int = 0
+
+    def selector(self, output: str) -> str:
+        if not self.named:
+            ws = str(self.index)
+        elif self.name.isdigit():
+            ws = f'"{self.name}"'
+        else:
+            ws = self.name
+        return f"{ws}/{output}"
+
+    def same_workspace(self, other: "Home") -> bool:
+        if self.named or other.named:
+            return self.named == other.named and self.name == other.name
+        return self.index == other.index
+
+
+def umbriel(*args: str) -> str:
+    return subprocess.run(["umbriel", *args], capture_output=True, text=True, check=True).stdout
+
+
+def query(kind: str) -> list:
+    return json.loads(umbriel(kind, "--json"))
+
+
+def is_external_monitor(output: dict) -> bool:
+    # Virtual outputs (`umbriel output-create`) have no monitor identity.
+    return output.get("config_name") is not None and not output["name"].startswith(INTERNAL_PREFIXES)
+
+
+class Keeper:
+    def __init__(self, state_path: str, dry_run: bool, adopt: bool):
+        self.state_path = state_path
+        self.dry_run = dry_run
+        self.adopt = adopt
+        # Where each window lives while its output is present.
+        self.homes: dict[str, Home] = {}
+        # Windows we moved off a missing output, keyed to the home they return to.
+        self.parked: dict[str, Home] = {}
+        # Outputs present at the last reconcile, to notice new arrivals.
+        self.present: set[str] | None = None
+        # Every output name seen as an external monitor.
+        self.external: set[str] = set()
+        self.load()
+
+    def load(self) -> None:
+        try:
+            with open(self.state_path) as f:
+                state = json.load(f)
+            self.homes = {k: Home(**v) for k, v in state.get("homes", {}).items()}
+            self.parked = {k: Home(**v) for k, v in state.get("parked", {}).items()}
+            if "present" in state:
+                self.present = set(state["present"])
+            self.external = set(state.get("external", []))
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError, TypeError) as e:
+            log.warning("ignoring unreadable state %s: %s", self.state_path, e)
+
+    def save(self) -> None:
+        state = {
+            "homes": {k: asdict(v) for k, v in self.homes.items()},
+            "parked": {k: asdict(v) for k, v in self.parked.items()},
+            "present": sorted(self.present or ()),
+            "external": sorted(self.external),
+        }
+        os.makedirs(os.path.dirname(self.state_path), exist_ok=True)
+        tmp = self.state_path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(state, f)
+        os.replace(tmp, self.state_path)
+
+    def reconcile(self) -> None:
+        # Query fresh state rather than trusting event payloads: Umbriel removes
+        # the output before it returns to the event loop, so by the time anything
+        # shows the evacuated windows, the output is already gone here too.
+        workspaces = query("workspaces")
+        windows = query("windows")
+        outputs = [o for o in query("outputs") if o.get("enabled")]
+        by_id = {ws["id"]: ws for ws in workspaces}
+        present = {ws["output"] for ws in workspaces} & {o["name"] for o in outputs}
+        self.external |= {o["name"] for o in outputs if is_external_monitor(o)}
+        if self.adopt and self.present is not None:
+            self.adopt_new_output(present)
+        self.present = present
+
+        moves: list[tuple[str, Home, str]] = []  # (window id, target home, output)
+        # Windows that just left a missing output, whether or not they need a
+        # move. Umbriel appends them in its own internal order, not layout order.
+        arrivals: list[tuple[str, Home, str]] = []
+        focused = None
+        seen = set()
+        for win in windows:
+            ws = by_id.get(win["workspace"])
+            # Umbriel moves scratchpads between outputs itself.
+            if ws is None or win.get("scratchpad"):
+                continue
+            wid = win["id"]
+            seen.add(wid)
+            if win.get("active"):
+                focused = wid
+            here = Home(ws["output"], ws["name"], ws["named"], ws["index"], win["x"], win["y"])
+
+            if wid in self.parked:
+                home = self.parked[wid]
+                if home.output in present:
+                    del self.parked[wid]
+                    if home.output != here.output or not home.same_workspace(here):
+                        moves.append((wid, home, home.output))
+                    self.homes[wid] = home
+                continue
+
+            home = self.homes.get(wid)
+            if home is not None and home.output not in present and here.output != home.output:
+                self.parked[wid] = home
+                if not home.same_workspace(here):
+                    moves.append((wid, home, here.output))
+                arrivals.append((wid, home, here.output))
+                continue
+
+            self.homes[wid] = here
+
+        for gone in (self.homes.keys() | self.parked.keys()) - seen:
+            self.homes.pop(gone, None)
+            self.parked.pop(gone, None)
+
+        if moves or arrivals:
+            self.apply(moves, arrivals, focused)
+        if not self.dry_run:
+            self.save()
+
+    def adopt_new_output(self, present: set[str]) -> None:
+        # Only the unambiguous case: one external monitor went away and one
+        # different external monitor appeared. With more of either, windows
+        # wait for their own monitor to return.
+        assert self.present is not None
+        new = (present - self.present) & self.external
+        missing = {h.output for h in [*self.homes.values(), *self.parked.values()] if h.output not in present}
+        if len(new) != 1 or len(missing) != 1 or not missing <= self.external:
+            return
+        (old,), (target,) = missing, new
+        log.info("adopting windows from %s onto %s", old, target)
+        # Homes on the missing output belong to windows Umbriel evacuated but
+        # that haven't been parked yet; they are displaced all the same.
+        for wid, home in list(self.homes.items()):
+            if home.output == old:
+                self.parked[wid] = replace(home, output=target)
+                del self.homes[wid]
+        for wid, home in self.parked.items():
+            if home.output == old:
+                self.parked[wid] = replace(home, output=target)
+
+    def apply(
+        self,
+        moves: list[tuple[str, Home, str]],
+        arrivals: list[tuple[str, Home, str]],
+        focused: str | None,
+    ) -> None:
+        # Fill workspaces in position order so a dynamic output has created
+        # workspace N by the time something targets N+1, and keep columns in
+        # their old left-to-right order.
+        for wid, home, output in sorted(moves, key=lambda m: (m[2], m[1].index, m[1].x, m[1].y)):
+            target = home.selector(output)
+            log.info("moving %s to %s (home %s:%s)", wid[:8], target, home.output, home.name)
+            self.msg(f"window-focus:{wid}", f"window-move-to-workspace-silent:{target}")
+        if arrivals:
+            self.reorder(arrivals)
+        if focused:
+            self.msg(f"window-focus:{focused}")
+
+    def reorder(self, arrivals: list[tuple[str, Home, str]]) -> None:
+        # Umbriel evacuates windows in its own internal order, not layout order,
+        # including the ones it already put on the right workspace. Rebuild the
+        # old left-to-right order by sending each column to the end in turn.
+        # This doesn't change workspaces, so Umbriel keeps its memory of the
+        # windows it placed and still restores their exact layout later.
+        windows = {w["id"]: w for w in query("windows")}
+        by_workspace: dict[str, list[tuple[str, Home]]] = {}
+        for wid, home, _ in arrivals:
+            win = windows.get(wid)
+            if win is not None and not win["floating"]:
+                by_workspace.setdefault(win["workspace"], []).append((wid, home))
+        for workspace, entries in by_workspace.items():
+            wanted = [wid for wid, _ in sorted(entries, key=lambda e: (e[1].index, e[1].x, e[1].y))]
+            current = sorted(wanted, key=lambda wid: (windows[wid]["x"], windows[wid]["y"]))
+            if current == wanted:
+                continue
+            log.info("restoring column order of %d windows on %s", len(wanted), workspace)
+            for wid in wanted:
+                # Column actions apply to the output under the pointer, not
+                # the focused window's output, so take the pointer along.
+                self.msg(f"window-focus-warp:{wid}", "column-move-to-last")
+
+    def msg(self, *actions: str) -> None:
+        if self.dry_run:
+            return
+        for action in actions:
+            try:
+                umbriel("msg", action)
+            except subprocess.CalledProcessError as e:
+                log.warning("%s failed: %s", action, (e.stderr or e.stdout).strip())
+                return
+
+
+def run(keeper: Keeper) -> int:
+    proc = subprocess.Popen(
+        ["umbriel", "subscribe", "windows,workspaces"],
+        stdout=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+    assert proc.stdout is not None
+    sel = selectors.DefaultSelector()
+    sel.register(proc.stdout, selectors.EVENT_READ)
+
+    first_pending = None
+    last_event = 0.0
+    while True:
+        timeout = None
+        if first_pending is not None:
+            due = min(last_event + DEBOUNCE_S, first_pending + MAX_DELAY_S)
+            timeout = max(0.0, due - time.monotonic())
+        if sel.select(timeout):
+            if not proc.stdout.readline():
+                log.error("event stream closed (umbriel exited?)")
+                return 1
+            last_event = time.monotonic()
+            first_pending = first_pending or last_event
+            continue
+        first_pending = None
+        try:
+            keeper.reconcile()
+        except (subprocess.CalledProcessError, ValueError, KeyError) as e:
+            log.warning("reconcile failed: %s", e)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--dry-run", action="store_true", help="log moves without performing them")
+    parser.add_argument(
+        "--adopt-new-outputs",
+        action="store_true",
+        help="when one external monitor is gone and a different one appears, move its windows there",
+    )
+    parser.add_argument("-v", "--verbose", action="store_true")
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(levelname)s %(message)s",
+        stream=sys.stderr,
+    )
+    state_home = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+    state_path = os.path.join(state_home, "umbriel-workspace-keeper", "state.json")
+    keeper = Keeper(state_path, args.dry_run, args.adopt_new_outputs)
+    try:
+        return run(keeper)
+    except KeyboardInterrupt:
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

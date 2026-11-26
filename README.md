@@ -13,9 +13,9 @@ Upstream request for doing this in the compositor:
 - Listens to `umbriel subscribe windows,workspaces` and remembers each
   window's home (output and workspace).
 - When a window shows up on another output because its home output went away,
-  it is moved to the matching workspace with `window-focus:<id>` +
-  `window-move-to-workspace-silent:<ws>/<output>`, and remembered as parked.
-  Keyboard focus is restored afterwards.
+  it is moved to the matching workspace with `window-focus <id>` +
+  `window-move-to-workspace-silent <ws> --output <output>`, and remembered as
+  parked. Keyboard focus is restored afterwards.
 - When the home output comes back, parked windows are moved back to it.
 - Umbriel evacuates windows in its own internal order, not layout order, so
   afterwards each workspace's old left-to-right order is rebuilt with
@@ -31,7 +31,8 @@ which is why the move back is handled here too.
 
 ## Requirements
 
-- Umbriel with the `subscribe` IPC command (tested with 0.1.0, `eed6c60ba450`)
+- Umbriel with space-separated action arguments, from the Oct 30 2026 release
+  on (tested with 0.1.0, `6a7ee9587c52`)
 - Python 3.10 or newer, standard library only
 - A systemd user session, for the included unit
 

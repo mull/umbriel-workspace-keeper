@@ -44,14 +44,11 @@ class Home:
     x: int = 0
     y: int = 0
 
-    def selector(self, output: str) -> str:
-        if not self.named:
-            ws = str(self.index)
-        elif self.name.isdigit():
-            ws = f'"{self.name}"'
-        else:
-            ws = self.name
-        return f"{ws}/{output}"
+    def selector(self, output: str) -> list[str]:
+        # Bare digits select a position, so force name lookup for named
+        # workspaces; that also covers all-digit names and leading dashes.
+        ws = ["--name", self.name] if self.named else [str(self.index)]
+        return [*ws, "--output", output]
 
     def same_workspace(self, other: "Home") -> bool:
         if self.named or other.named:
@@ -205,12 +202,12 @@ class Keeper:
         # their old left-to-right order.
         for wid, home, output in sorted(moves, key=lambda m: (m[2], m[1].index, m[1].x, m[1].y)):
             target = home.selector(output)
-            log.info("moving %s to %s (home %s:%s)", wid[:8], target, home.output, home.name)
-            self.msg(f"window-focus:{wid}", f"window-move-to-workspace-silent:{target}")
+            log.info("moving %s to %s (home %s:%s)", wid[:8], " ".join(target), home.output, home.name)
+            self.msg(["window-focus", wid], ["window-move-to-workspace-silent", *target])
         if arrivals:
             self.reorder(arrivals)
         if focused:
-            self.msg(f"window-focus:{focused}")
+            self.msg(["window-focus", focused])
 
     def reorder(self, arrivals: list[tuple[str, Home, str]]) -> None:
         # Umbriel evacuates windows in its own internal order, not layout order,
@@ -233,16 +230,17 @@ class Keeper:
             for wid in wanted:
                 # Column actions apply to the output under the pointer, not
                 # the focused window's output, so take the pointer along.
-                self.msg(f"window-focus-warp:{wid}", "column-move-to-last")
+                self.msg(["window-focus-warp", wid], ["column-move-to-last"])
 
-    def msg(self, *actions: str) -> None:
+    def msg(self, *actions: list[str]) -> None:
+        # Each action is its name followed by its arguments as separate words.
         if self.dry_run:
             return
         for action in actions:
             try:
-                umbriel("msg", action)
+                umbriel("msg", *action)
             except subprocess.CalledProcessError as e:
-                log.warning("%s failed: %s", action, (e.stderr or e.stdout).strip())
+                log.warning("%s failed: %s", " ".join(action), (e.stderr or e.stdout).strip())
                 return
 
 
